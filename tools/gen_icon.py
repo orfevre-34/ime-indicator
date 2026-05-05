@@ -1,3 +1,9 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pillow>=10",
+# ]
+# ///
 """IME Indicator のアプリアイコンを生成する。
 
 256/128/64/48/32/16 px の PNG を作って ICO にまとめる。
@@ -5,7 +11,7 @@
 Mac の IME インジケータ風のミニマル意匠。
 
 実行:
-    python tools/gen_icon.py
+    uv run tools/gen_icon.py
 """
 
 from __future__ import annotations

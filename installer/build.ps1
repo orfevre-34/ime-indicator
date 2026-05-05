@@ -25,7 +25,8 @@ if (-not (Test-Path $IcoPath)) {
     Write-Host "[2/3] generating icon (assets/icon.ico is missing)" -ForegroundColor Cyan
     Push-Location $Root
     try {
-        python tools/gen_icon.py
+        # uv run なら PEP 723 inline deps が自動解決される。システム Python は汚染しない。
+        uv run tools/gen_icon.py
         if ($LASTEXITCODE -ne 0) { throw "icon generation failed" }
     } finally {
         Pop-Location

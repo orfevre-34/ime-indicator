@@ -22,7 +22,7 @@ pwsh .\installer\build.ps1
 
 ```sh
 cargo build --release
-python tools/gen_icon.py            # 初回のみ
+uv run tools/gen_icon.py             # 初回のみ。Pillow は uv が隔離環境に自動インストール
 "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\setup.iss
 ```
 
