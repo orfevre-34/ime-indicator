@@ -32,11 +32,7 @@ pub fn read_current_mode() -> Option<ImeMode> {
         let open = ImmGetOpenStatus(himc).as_bool();
         let mut conv = IME_CONVERSION_MODE::default();
         let mut sent = IME_SENTENCE_MODE::default();
-        let _ = ImmGetConversionStatus(
-            himc,
-            Some(&mut conv as *mut _),
-            Some(&mut sent as *mut _),
-        );
+        let _ = ImmGetConversionStatus(himc, Some(&mut conv as *mut _), Some(&mut sent as *mut _));
         let _ = ImmReleaseContext(hwnd, himc);
 
         Some(if !open {

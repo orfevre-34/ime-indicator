@@ -78,11 +78,7 @@ fn main() -> windows::core::Result<()> {
 
         // レイヤード + 透過 + ツールウィンドウ + 最前面 + 非アクティブ。
         let hwnd: HWND = CreateWindowExW(
-            WS_EX_LAYERED
-                | WS_EX_TRANSPARENT
-                | WS_EX_TOOLWINDOW
-                | WS_EX_TOPMOST
-                | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             class_name,
             w!("IME Indicator"),
             WS_POPUP,
@@ -211,4 +207,3 @@ fn on_fade_tick(hwnd: HWND) {
         }
     });
 }
-

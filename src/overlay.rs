@@ -81,14 +81,7 @@ impl Overlay {
             };
 
             let mut bits: *mut c_void = ptr::null_mut();
-            let dib = CreateDIBSection(
-                Some(screen_dc),
-                &bmi,
-                DIB_RGB_COLORS,
-                &mut bits,
-                None,
-                0,
-            )?;
+            let dib = CreateDIBSection(Some(screen_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)?;
             let old_obj = SelectObject(mem_dc, dib.into());
             ReleaseDC(None, screen_dc);
 
@@ -166,8 +159,12 @@ impl Overlay {
             self.rt.BeginDraw();
 
             // 完全透明でクリア。
-            self.rt
-                .Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+            self.rt.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
 
             // 背景ラウンド矩形: rgba(28, 28, 30, 0.85) を opacity で減衰。
             let bg = self.rt.CreateSolidColorBrush(
@@ -274,4 +271,3 @@ impl Drop for Overlay {
         }
     }
 }
-
