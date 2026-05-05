@@ -1,0 +1,74 @@
+name: release
+
+# v* タグを push したときだけ動く。例:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# 流れ:
+#   1. cargo build --release で ime-indicator.exe を作る
+#   2. Inno Setup を choco でインストール
+#   3. installer/setup.iss をコンパイルして IMEIndicator-Setup.exe を作る
+#   4. ime-indicator.exe と IMEIndicator-Setup.exe を GitHub Release に添付
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+        shell: pwsh
+
+      - name: Compile installer
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc installer/setup.iss
+        shell: pwsh
+
+      - name: Show artifacts
+        run: |
+          Get-Item target/release/ime-indicator.exe | Select-Object Name, Length
+          Get-Item installer/out/IMEIndicator-Setup.exe | Select-Object Name, Length
+        shell: pwsh
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer/out/IMEIndicator-Setup.exe
+            target/release/ime-indicator.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+      - name: Upload artifacts (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ime-indicator-build
+          path: |
+            installer/out/IMEIndicator-Setup.exe
+            target/release/ime-indicator.exe
