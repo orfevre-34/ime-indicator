@@ -100,23 +100,45 @@ fn main() -> windows::core::Result<()> {
         let dpi = GetDpiForSystem();
         let dpi_scale = dpi as f32 / 96.0;
 
+        #[cfg(debug_assertions)]
+        eprintln!("ime-indicator: dpi={dpi} scale={dpi_scale}");
+
         let overlay = Overlay::new(hwnd, dpi_scale)?;
+        #[cfg(debug_assertions)]
+        eprintln!("ime-indicator: overlay created");
 
         // レイヤードウィンドウは UpdateLayeredWindow を最初に必ず呼んでから ShowWindow
         // しないと「描画なしの空ウィンドウ」が一瞬だけ見えてしまう / ShowWindow 自体が
         // 効かないことがある。完全透明 (opacity=0) でオフスクリーンにプライミングしておく。
         overlay.render(-10_000, -10_000, ImeMode::Alpha, 0.0)?;
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        #[cfg(debug_assertions)]
+        eprintln!("ime-indicator: window shown (priming render done)");
+
+        // 起動直後の見える化: 現在の IME モードを一瞬出して、
+        // 「ちゃんとプロセスが動いて描画もできている」ことをユーザに示す。
+        let initial_mode = ime::read_current_mode().unwrap_or(ImeMode::Alpha);
+        #[cfg(debug_assertions)]
+        eprintln!("ime-indicator: detected initial mode = {initial_mode:?}");
+
+        let mut app_state = App::new();
+        app_state.current_mode = initial_mode;
+        app_state.last_mode = Some(initial_mode);
+
+        let anchor = caret::indicator_anchor();
+        let (w, _) = overlay.size_px();
+        app_state.on_mode_changed(initial_mode, (anchor.0 - w / 2, anchor.1));
 
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
                 overlay,
-                app: App::new(),
+                app: app_state,
             });
         });
 
-        // ポーリングタイマー（IME 状態用）。fade タイマーは on_mode_changed のたびに張り直す。
+        // ポーリング + 初期フェードの両タイマーを開始。
         SetTimer(Some(hwnd), TIMER_POLL, POLL_INTERVAL_MS, None);
+        SetTimer(Some(hwnd), TIMER_FADE, FADE_INTERVAL_MS, None);
 
         // メッセージループ。
         let mut msg = MSG::default();
