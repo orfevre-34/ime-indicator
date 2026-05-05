@@ -9,18 +9,29 @@ Windows 用インストーラ（exe 形式）を [Inno Setup 6](https://jrsoftwa
 
 ## ビルド手順
 
-```sh
-# 1. リリースバイナリを作る
-cargo build --release
+PowerShell から一発で:
 
-# 2. インストーラ用アイコンを生成（初回のみ）
-python tools/gen_icon.py
-
-# 3. Inno Setup でコンパイル
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\setup.iss
+```powershell
+pwsh .\installer\build.ps1
 ```
 
-成果物: `installer\out\IMEIndicator-Setup.exe`
+これが `cargo build --release` → アイコン生成チェック → ISCC.exe 自動検出 →
+インストーラコンパイル までやってくれる。
+
+手動でやるなら:
+
+```sh
+cargo build --release
+python tools/gen_icon.py            # 初回のみ
+"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" installer\setup.iss
+```
+
+`winget install JRSoftware.InnoSetup` で入れた場合、ISCC.exe は通常
+`%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe` にある。
+システム全体にインストールされている場合は
+`C:\Program Files (x86)\Inno Setup 6\ISCC.exe`。
+
+成果物: `installer\out\IMEIndicator-Setup.exe`（lzma2 圧縮で約 2 MB）
 
 ## インストーラの挙動
 
