@@ -78,7 +78,6 @@ impl App {
             }
         }
     }
-
 }
 
 fn ease_out(t: f32) -> f32 {

@@ -1,9 +1,9 @@
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::Ime::{
     IME_CMODE_NATIVE, IME_CONVERSION_MODE, IME_SENTENCE_MODE, ImmGetContext,
     ImmGetConversionStatus, ImmGetOpenStatus, ImmReleaseContext,
 };
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

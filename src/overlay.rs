@@ -128,13 +128,7 @@ impl Overlay {
     }
 
     /// 指定座標にインジケータを再描画して表示更新する。
-    pub fn render(
-        &self,
-        screen_x: i32,
-        screen_y: i32,
-        mode: ImeMode,
-        opacity: f32,
-    ) -> Result<()> {
+    pub fn render(&self, screen_x: i32, screen_y: i32, mode: ImeMode, opacity: f32) -> Result<()> {
         let opacity = opacity.clamp(0.0, 1.0);
         unsafe {
             // BindDC は毎フレーム呼ぶのが規約。RT はその DC のサイズに合わせて初期化される。

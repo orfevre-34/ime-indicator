@@ -358,10 +358,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             let kbd = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
             let vk = kbd.vkCode;
             #[cfg(debug_assertions)]
-            eprintln!(
-                "ime-indicator: keyup vk=0x{:x} sc=0x{:x}",
-                vk, kbd.scanCode
-            );
+            eprintln!("ime-indicator: keyup vk=0x{:x} sc=0x{:x}", vk, kbd.scanCode);
 
             if let Some(action) = vk_to_action(vk) {
                 let cur = MODE_ATOM.load(Ordering::Relaxed);
