@@ -1,13 +1,14 @@
-// Mac ライクな「a / あ」インジケータ。フォアグラウンドの IME 状態変化を検出し、
-// キャレット付近に小さなオーバーレイをフェード表示する。
+// Mac ライクな「a / あ」インジケータ。任意のキー入力中はキャレット付近に小さな
+// オーバーレイを出し続け、入力が止まって 1.5 秒経つとフェードアウトする。
 //
-// 検出経路は 2 系統:
+// 検出経路:
 //
-//  1. 低レベルキーボードフック (WH_KEYBOARD_LL) で IME 切替系のキーを直接捕まえる。
-//     Chrome/Edge/VS Code/Windows Terminal などモダンな TSF 系アプリでは ImmGetContext
-//     で状態を読めないので、こちらが主検出経路。
+//  1. 低レベルキーボードフック (WH_KEYBOARD_LL) で全キーストロークを取得し、
+//     IME 切替系のキーはモード変化の通知に、それ以外のキーは「打鍵中」シグナル
+//     として表示寿命を延ばす経路に流す。Chrome/Edge/VS Code/Windows Terminal
+//     などモダン TSF アプリでも反応する。
 //  2. 100ms 周期のポーリング (ImmGetContext + AttachThreadInput)。古典的な IMM
-//     系アプリ向けの保険。マウスで IME バーを操作した場合などキー以外の経路でも拾える。
+//     系アプリ向けに、キー以外（マウスで IME バー操作）でも変化を拾えるようにする。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -44,15 +45,15 @@ const TIMER_FADE: usize = 2;
 const POLL_INTERVAL_MS: u32 = 100;
 const FADE_INTERVAL_MS: u32 = 16;
 
-/// キーボードフックから WndProc にモード変化を通知するためのアプリ独自メッセージ。
+/// IME のモードが変わった通知。wparam にモード(int)を載せる。
 const WM_APP_IME_CHANGED: u32 = WM_APP + 1;
+/// IME とは無関係なキー入力があった通知。表示寿命の延長に使う。
+const WM_APP_KEY_ACTIVITY: u32 = WM_APP + 2;
 
 const MODE_ALPHA: i32 = 0;
 const MODE_HIRAGANA: i32 = 1;
 const MODE_OTHER: i32 = 2;
 
-/// キーボードフックは extern "system" の関数。State (RefCell<…>) を直接触れないので、
-/// 「現在モード」「オーバーレイの HWND」を atomic で共有する。
 static MODE_ATOM: AtomicI32 = AtomicI32::new(MODE_ALPHA);
 static OVERLAY_HWND_ATOM: AtomicIsize = AtomicIsize::new(0);
 static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
@@ -119,13 +120,9 @@ fn main() -> windows::core::Result<()> {
         // UpdateLayeredWindow を最初に通してから ShowWindow しないと初回表示が出ないことがある。
         overlay.render(-10_000, -10_000, ImeMode::Alpha, 0.0)?;
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        #[cfg(debug_assertions)]
-        eprintln!("ime-indicator: window shown");
 
-        // フックから PostMessage で通知できるよう、HWND を atomic に共有。
         OVERLAY_HWND_ATOM.store(hwnd.0 as isize, Ordering::Relaxed);
 
-        // 起動時の現在モード推定（ImmGetContext が効くアプリだけ取れる）。
         let initial_mode = ime::read_current_mode().unwrap_or(ImeMode::Alpha);
         MODE_ATOM.store(mode_to_int(initial_mode), Ordering::Relaxed);
         #[cfg(debug_assertions)]
@@ -135,7 +132,7 @@ fn main() -> windows::core::Result<()> {
         app_state.current_mode = initial_mode;
         app_state.last_mode = Some(initial_mode);
 
-        // 起動の見える化として 1 度フェード表示。
+        // 起動時にも 1 度フェード表示（プロセスが動いている見える化を兼ねる）。
         let anchor = caret::indicator_anchor();
         let (w_px, _) = overlay.size_px();
         app_state.on_mode_changed(initial_mode, (anchor.0 - w_px / 2, anchor.1));
@@ -147,7 +144,6 @@ fn main() -> windows::core::Result<()> {
             });
         });
 
-        // 低レベルキーボードフック登録。これが効かないとモダン TSF アプリで何も拾えない。
         match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) {
             Ok(hook) => {
                 HOOK_HANDLE.store(hook.0 as isize, Ordering::Relaxed);
@@ -195,6 +191,10 @@ unsafe extern "system" fn wnd_proc(
                 apply_mode_change(hwnd, new_mode);
                 LRESULT(0)
             }
+            m if m == WM_APP_KEY_ACTIVITY => {
+                apply_key_activity(hwnd);
+                LRESULT(0)
+            }
             WM_DESTROY => {
                 let _ = KillTimer(Some(hwnd), TIMER_POLL);
                 let _ = KillTimer(Some(hwnd), TIMER_FADE);
@@ -202,7 +202,7 @@ unsafe extern "system" fn wnd_proc(
                 if raw != 0 {
                     let _ = UnhookWindowsHookEx(HHOOK(raw as *mut _));
                 }
-                STATE.with(|s| s.borrow_mut().take()); // overlay を drop
+                STATE.with(|s| s.borrow_mut().take());
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -211,15 +211,17 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-/// IME モード変化が来たときに呼ぶ。常駐表示なのでフェードはやり直さず、
-/// 表示中の文字と座標だけ即座に差し替えて 1 度描画する。
-fn apply_mode_change(_hwnd: HWND, mode: ImeMode) {
+fn ensure_fade_timer(hwnd: HWND) {
+    unsafe {
+        SetTimer(Some(hwnd), TIMER_FADE, FADE_INTERVAL_MS, None);
+    }
+}
+
+/// IME モード変化を反映。表示中の文字と座標を更新し、見せ始める / 見せ続ける。
+fn apply_mode_change(hwnd: HWND, mode: ImeMode) {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         let Some(state) = s.as_mut() else { return };
-        if mode == state.app.current_mode {
-            return;
-        }
         let anchor = caret::indicator_anchor();
         let (w_px, _) = state.overlay.size_px();
         let pos = (anchor.0 - w_px / 2, anchor.1);
@@ -229,11 +231,26 @@ fn apply_mode_change(_hwnd: HWND, mode: ImeMode) {
             state.app.current_mode, mode, pos
         );
         state.app.on_mode_changed(mode, pos);
-        let opacity = state.app.current_opacity();
-        let _ = state
-            .overlay
-            .render(pos.0, pos.1, state.app.current_mode, opacity);
     });
+    ensure_fade_timer(hwnd);
+}
+
+/// IME とは無関係なキー入力。モードは変えず、表示寿命を延ばすだけ。
+/// Hidden / FadeOut からの復帰時はキャレット位置を取り直す。
+fn apply_key_activity(hwnd: HWND) {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let Some(state) = s.as_mut() else { return };
+        if state.app.is_hidden()
+            || matches!(state.app.phase, crate::app::Phase::FadeOut { .. })
+        {
+            let anchor = caret::indicator_anchor();
+            let (w_px, _) = state.overlay.size_px();
+            state.app.set_anchor((anchor.0 - w_px / 2, anchor.1));
+        }
+        state.app.on_key_activity();
+    });
+    ensure_fade_timer(hwnd);
 }
 
 fn on_poll_tick(_hwnd: HWND) {
@@ -266,7 +283,6 @@ fn on_poll_tick(_hwnd: HWND) {
         let new_int = mode_to_int(mode);
         let prev_int = MODE_ATOM.swap(new_int, Ordering::Relaxed);
         if prev_int != new_int {
-            // フックと同じ経路（apply_mode_change）に流す。
             let raw = OVERLAY_HWND_ATOM.load(Ordering::Relaxed);
             if raw != 0 {
                 unsafe {
@@ -281,19 +297,15 @@ fn on_poll_tick(_hwnd: HWND) {
         }
     }
 
-    // 常駐表示なので、ポーリングのたびにキャレット位置を再取得して再描画する。
-    // 16ms で回すと UIA のコストがバカにならないので、100ms 毎の再描画に留める。
+    // 表示中はキャレット位置の追従だけ更新する（再描画は TIMER_FADE 任せ）。
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         let Some(state) = s.as_mut() else { return };
-        let anchor = caret::indicator_anchor();
-        let (w_px, _) = state.overlay.size_px();
-        let pos = (anchor.0 - w_px / 2, anchor.1);
-        state.app.anchor = pos;
-        let opacity = state.app.current_opacity();
-        let _ = state
-            .overlay
-            .render(pos.0, pos.1, state.app.current_mode, opacity);
+        if state.app.is_visible() {
+            let anchor = caret::indicator_anchor();
+            let (w_px, _) = state.overlay.size_px();
+            state.app.anchor = (anchor.0 - w_px / 2, anchor.1);
+        }
     });
 }
 
@@ -303,19 +315,21 @@ fn on_fade_tick(hwnd: HWND) {
         let Some(state) = s.as_mut() else { return };
 
         let opacity = state.app.current_opacity();
+        if state.app.is_hidden() {
+            // 非表示。タイマー停止 + オフスクリーンに完全透明で 1 度描いて消す。
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_FADE);
+            }
+            let _ = state
+                .overlay
+                .render(-10_000, -10_000, state.app.current_mode, 0.0);
+            return;
+        }
         let (x, y) = state.app.anchor;
         if let Err(e) = state.overlay.render(x, y, state.app.current_mode, opacity) {
             #[cfg(debug_assertions)]
             eprintln!("ime-indicator: render error: {e}");
             let _ = e;
-        }
-
-        // 起動時のフェードインが終わったら 16ms タイマーを止める。以降の再描画は
-        // 100ms ポーリングの方で十分（常駐表示で動かない）。
-        if !state.app.is_animating() {
-            unsafe {
-                let _ = KillTimer(Some(hwnd), TIMER_FADE);
-            }
         }
     });
 }
@@ -336,7 +350,6 @@ fn int_to_mode(i: i32) -> ImeMode {
     }
 }
 
-/// 押されたキーから次のモードを決める。`Some(toggle)` のときは現在状態を反転する。
 enum KeyAction {
     SetAlpha,
     SetHiragana,
@@ -346,62 +359,70 @@ enum KeyAction {
 
 fn vk_to_action(vk: u32) -> Option<KeyAction> {
     match vk {
-        // 半角/全角キー (VK_KANJI / VK_HANJA = 0x19): IME on/off トグル。
-        0x19 => Some(KeyAction::Toggle),
-        // VK_KANA / VK_HANGUL = 0x15: トグル扱い。
-        0x15 => Some(KeyAction::Toggle),
-        // VK_IME_ON = 0x16 / VK_IME_OFF = 0x1A.
-        0x16 => Some(KeyAction::SetHiragana),
-        0x1A => Some(KeyAction::SetAlpha),
-        // VK_DBE_ALPHANUMERIC = 0xF0 (英数 / lang0)
-        0xF0 => Some(KeyAction::SetAlpha),
-        // VK_DBE_KATAKANA = 0xF1
-        0xF1 => Some(KeyAction::SetKatakana),
-        // VK_DBE_HIRAGANA = 0xF2 (かな / lang1)
-        0xF2 => Some(KeyAction::SetHiragana),
-        // VK_DBE_SBCSCHAR (0xF3) / VK_DBE_DBCSCHAR (0xF4): 半角/全角トグル系。
-        0xF3 | 0xF4 => Some(KeyAction::Toggle),
+        0x19 => Some(KeyAction::Toggle),       // VK_KANJI / VK_HANJA (半角/全角)
+        0x15 => Some(KeyAction::Toggle),       // VK_KANA / VK_HANGUL
+        0x16 => Some(KeyAction::SetHiragana),  // VK_IME_ON
+        0x1A => Some(KeyAction::SetAlpha),     // VK_IME_OFF
+        0xF0 => Some(KeyAction::SetAlpha),     // VK_DBE_ALPHANUMERIC (英数 / lang0)
+        0xF1 => Some(KeyAction::SetKatakana),  // VK_DBE_KATAKANA
+        0xF2 => Some(KeyAction::SetHiragana),  // VK_DBE_HIRAGANA (かな / lang1)
+        0xF3 | 0xF4 => Some(KeyAction::Toggle), // VK_DBE_SBCSCHAR / DBCSCHAR
         _ => None,
     }
 }
 
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // HC_ACTION = 0。それ以外は触らずに次のフックへ。
     if code == 0 {
         let msg_kind = wparam.0 as u32;
-        // KEYUP のときだけ反応（押しっぱなしの自動リピートで暴れないように）。
         if msg_kind == WM_KEYUP || msg_kind == WM_SYSKEYUP {
             let kbd = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
             let vk = kbd.vkCode;
             #[cfg(debug_assertions)]
             eprintln!("ime-indicator: keyup vk=0x{:x} sc=0x{:x}", vk, kbd.scanCode);
 
-            if let Some(action) = vk_to_action(vk) {
-                let cur = MODE_ATOM.load(Ordering::Relaxed);
-                let new = match action {
-                    KeyAction::SetAlpha => MODE_ALPHA,
-                    KeyAction::SetHiragana => MODE_HIRAGANA,
-                    KeyAction::SetKatakana => MODE_OTHER,
-                    KeyAction::Toggle => {
-                        if cur == MODE_ALPHA {
-                            MODE_HIRAGANA
-                        } else {
-                            MODE_ALPHA
+            let raw = OVERLAY_HWND_ATOM.load(Ordering::Relaxed);
+            if raw != 0 {
+                let target = HWND(raw as *mut _);
+
+                // IME 切替系のキーは「モード変化」を試みる。変わらなかったら通常の打鍵扱い。
+                let mut handled_as_mode_change = false;
+                if let Some(action) = vk_to_action(vk) {
+                    let cur = MODE_ATOM.load(Ordering::Relaxed);
+                    let new = match action {
+                        KeyAction::SetAlpha => MODE_ALPHA,
+                        KeyAction::SetHiragana => MODE_HIRAGANA,
+                        KeyAction::SetKatakana => MODE_OTHER,
+                        KeyAction::Toggle => {
+                            if cur == MODE_ALPHA {
+                                MODE_HIRAGANA
+                            } else {
+                                MODE_ALPHA
+                            }
                         }
-                    }
-                };
-                let prev = MODE_ATOM.swap(new, Ordering::Relaxed);
-                if prev != new {
-                    let raw = OVERLAY_HWND_ATOM.load(Ordering::Relaxed);
-                    if raw != 0 {
+                    };
+                    let prev = MODE_ATOM.swap(new, Ordering::Relaxed);
+                    if prev != new {
                         unsafe {
                             let _ = PostMessageW(
-                                Some(HWND(raw as *mut _)),
+                                Some(target),
                                 WM_APP_IME_CHANGED,
                                 WPARAM(new as usize),
                                 LPARAM(0),
                             );
                         }
+                        handled_as_mode_change = true;
+                    }
+                }
+
+                // モード変化でなかった場合は通常の打鍵として活動シグナルを送る。
+                if !handled_as_mode_change {
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(target),
+                            WM_APP_KEY_ACTIVITY,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
                     }
                 }
             }
