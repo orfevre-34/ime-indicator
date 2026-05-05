@@ -10,7 +10,7 @@
 ;   installer\out\IMEIndicator-Setup.exe
 
 #define AppName       "IME Indicator"
-#define AppVersion    "0.1.0"
+#define AppVersion    "0.1.1"
 #define AppPublisher  "tikeg"
 #define AppURL        ""
 #define ExeName       "ime-indicator.exe"
