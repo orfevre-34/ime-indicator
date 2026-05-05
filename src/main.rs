@@ -16,11 +16,13 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer,
-    LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SetTimer,
-    ShowWindow, TranslateMessage, WM_DESTROY, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_SHOWNOACTIVATE, SetTimer, ShowWindow,
+    TranslateMessage, WM_DESTROY, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::w;
+
+use crate::ime::ImeMode;
 
 use crate::app::App;
 use crate::overlay::Overlay;
@@ -99,17 +101,19 @@ fn main() -> windows::core::Result<()> {
         let dpi_scale = dpi as f32 / 96.0;
 
         let overlay = Overlay::new(hwnd, dpi_scale)?;
+
+        // レイヤードウィンドウは UpdateLayeredWindow を最初に必ず呼んでから ShowWindow
+        // しないと「描画なしの空ウィンドウ」が一瞬だけ見えてしまう / ShowWindow 自体が
+        // 効かないことがある。完全透明 (opacity=0) でオフスクリーンにプライミングしておく。
+        overlay.render(-10_000, -10_000, ImeMode::Alpha, 0.0)?;
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
                 overlay,
                 app: App::new(),
             });
         });
-
-        // ウィンドウ自体は出しておくが、内容は UpdateLayeredWindow を呼ぶまで空。
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        // 念のため: 最初は隠す（UpdateLayeredWindow 未呼の状態を見せない）。
-        let _ = ShowWindow(hwnd, SW_HIDE);
 
         // ポーリングタイマー（IME 状態用）。fade タイマーは on_mode_changed のたびに張り直す。
         SetTimer(Some(hwnd), TIMER_POLL, POLL_INTERVAL_MS, None);
@@ -155,16 +159,20 @@ unsafe extern "system" fn wnd_proc(
 
 fn on_poll_tick(hwnd: HWND) {
     let Some(mode) = ime::read_current_mode() else {
+        // フォアグラウンドが IME コンテキストを持たないアプリ（一部の Win32 / コマンドプロンプト等）。
+        // 何もせず次のポーリングを待つ。
         return;
     };
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         let Some(state) = s.as_mut() else { return };
 
-        // 起動直後の空状態を埋める（トリガしない）。
+        // 起動直後の空状態を埋める（最初の 1 回はトリガしない。今のモードを基準にする）。
         if state.app.last_mode.is_none() && !state.app.is_visible() {
             state.app.current_mode = mode;
             state.app.last_mode = Some(mode);
+            #[cfg(debug_assertions)]
+            eprintln!("ime-indicator: initial mode = {:?}", mode);
             return;
         }
 
@@ -174,14 +182,15 @@ fn on_poll_tick(hwnd: HWND) {
             // アンカーから少し左にずらしてキャレット中央寄りに。
             let x = anchor.0 - w / 2;
             let y = anchor.1;
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "ime-indicator: {:?} -> {:?} @ ({}, {})",
+                state.app.current_mode, mode, x, y
+            );
             state.app.on_mode_changed(mode, (x, y));
-            // フェード用の高頻度タイマー開始。
+            // フェード用の高頻度タイマー開始。ウィンドウは常に visible なので Show は不要。
             unsafe {
                 SetTimer(Some(hwnd), TIMER_FADE, FADE_INTERVAL_MS, None);
-                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE,
-                );
             }
         }
     });
@@ -195,14 +204,20 @@ fn on_fade_tick(hwnd: HWND) {
         match state.app.tick() {
             Some(opacity) => {
                 let (x, y) = state.app.anchor;
-                let _ = state.overlay.render(x, y, state.app.current_mode, opacity);
+                if let Err(e) = state.overlay.render(x, y, state.app.current_mode, opacity) {
+                    #[cfg(debug_assertions)]
+                    eprintln!("ime-indicator: render error: {e}");
+                    let _ = e;
+                }
             }
             None => {
-                // 非表示遷移。タイマー停止 + ウィンドウ非表示。
+                // 非表示遷移。タイマー停止 + 完全透明な状態を一度描いて画面から消す。
                 unsafe {
                     let _ = KillTimer(Some(hwnd), TIMER_FADE);
-                    let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, SW_HIDE);
                 }
+                let _ = state
+                    .overlay
+                    .render(-10_000, -10_000, state.app.current_mode, 0.0);
             }
         }
     });
