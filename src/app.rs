@@ -97,10 +97,6 @@ impl App {
         }
     }
 
-    pub fn is_visible(&self) -> bool {
-        !matches!(self.phase, Phase::Hidden)
-    }
-
     pub fn is_hidden(&self) -> bool {
         matches!(self.phase, Phase::Hidden)
     }

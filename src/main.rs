@@ -3,14 +3,10 @@
 // 実際に変わらなくても、トリガーキーの押下があれば必ず表示する。普通の
 // 文字キーや矢印キー等は表示には影響しない。
 //
-// 検出経路:
-//
-//  1. 低レベルキーボードフック (WH_KEYBOARD_LL) で IME トリガーキーだけを
-//     拾う。Chrome/Edge/VS Code/Windows Terminal などモダン TSF アプリでも
-//     OS レベルでキー入力が見えるので、こちらが主検出経路。
-//  2. 100ms 周期のポーリング (ImmGetContext + AttachThreadInput)。古典的な
-//     IMM 系アプリで、マウスで IME バーを操作した等キー以外の経路で起きた
-//     モード変化を拾うための保険。
+// 検出は WH_KEYBOARD_LL の単一経路。以前は IMM ポーリングを保険として併用
+// していたが、相手アプリの IME 状態を読むには AttachThreadInput が必要で、
+// 入力キューを共有するこの API は変換中の IME を勝手に確定／取消させて
+// ユーザーの入力を壊すことが分かったため廃止した。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -49,9 +45,7 @@ use crate::app::App;
 use crate::ime::ImeMode;
 use crate::overlay::Overlay;
 
-const TIMER_POLL: usize = 1;
 const TIMER_FADE: usize = 2;
-const POLL_INTERVAL_MS: u32 = 100;
 const FADE_INTERVAL_MS: u32 = 16;
 
 /// IME トリガーキー押下 or ポーリングでモード変化を検出した通知。
@@ -145,10 +139,12 @@ fn main() -> windows::core::Result<()> {
 
         OVERLAY_HWND_ATOM.store(hwnd.0 as isize, Ordering::Relaxed);
 
-        let initial_mode = ime::read_current_mode().unwrap_or(ImeMode::Alpha);
+        // 初期モードは推測しない（フォアグラウンドの IME 状態を読む手段は
+        // クロスプロセスでは AttachThreadInput が必須で、それが入力を壊すため廃止）。
+        // 起動直後は Alpha と仮定。ユーザーが最初にトリガーキーを押した瞬間に
+        // 正しい状態に同期される。
+        let initial_mode = ImeMode::Alpha;
         MODE_ATOM.store(mode_to_int(initial_mode), Ordering::Relaxed);
-        #[cfg(debug_assertions)]
-        eprintln!("ime-indicator: initial mode = {initial_mode:?}");
 
         let mut app_state = App::new();
         app_state.current_mode = initial_mode;
@@ -186,7 +182,7 @@ fn main() -> windows::core::Result<()> {
             let _ = e;
         }
 
-        SetTimer(Some(hwnd), TIMER_POLL, POLL_INTERVAL_MS, None);
+        // フェードイン用のタイマーだけ立てる。終わったら on_fade_tick が自分で止める。
         SetTimer(Some(hwnd), TIMER_FADE, FADE_INTERVAL_MS, None);
 
         let mut msg = MSG::default();
@@ -207,10 +203,7 @@ unsafe extern "system" fn wnd_proc(
     unsafe {
         match msg {
             WM_TIMER => {
-                let id = wparam.0;
-                if id == TIMER_POLL {
-                    on_poll_tick(hwnd);
-                } else if id == TIMER_FADE {
+                if wparam.0 == TIMER_FADE {
                     on_fade_tick(hwnd);
                 }
                 LRESULT(0)
@@ -246,7 +239,6 @@ unsafe extern "system" fn wnd_proc(
                 LRESULT(0)
             }
             WM_DESTROY => {
-                let _ = KillTimer(Some(hwnd), TIMER_POLL);
                 let _ = KillTimer(Some(hwnd), TIMER_FADE);
                 let _ = remove_tray_icon(hwnd);
                 let raw = HOOK_HANDLE.swap(0, Ordering::Relaxed);
@@ -284,62 +276,6 @@ fn apply_mode_change(hwnd: HWND, mode: ImeMode) {
         state.app.on_mode_changed(mode, pos);
     });
     ensure_fade_timer(hwnd);
-}
-
-fn on_poll_tick(_hwnd: HWND) {
-    let mode_opt = ime::read_current_mode();
-
-    #[cfg(debug_assertions)]
-    {
-        use std::cell::Cell;
-        thread_local! {
-            static POLL_COUNT: Cell<u32> = const { Cell::new(0) };
-        }
-        let n = POLL_COUNT.with(|c| {
-            let v = c.get() + 1;
-            c.set(v);
-            v
-        });
-        if n.is_multiple_of(10) {
-            let fg_hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
-            let cur = MODE_ATOM.load(Ordering::Relaxed);
-            eprintln!(
-                "ime-indicator: poll#{n} fg=0x{:x} imm={:?} state={:?}",
-                fg_hwnd.0 as usize,
-                mode_opt,
-                int_to_mode(cur)
-            );
-        }
-    }
-
-    if let Some(mode) = mode_opt {
-        let new_int = mode_to_int(mode);
-        let prev_int = MODE_ATOM.swap(new_int, Ordering::Relaxed);
-        if prev_int != new_int {
-            let raw = OVERLAY_HWND_ATOM.load(Ordering::Relaxed);
-            if raw != 0 {
-                unsafe {
-                    let _ = PostMessageW(
-                        Some(HWND(raw as *mut _)),
-                        WM_APP_IME_CHANGED,
-                        WPARAM(new_int as usize),
-                        LPARAM(0),
-                    );
-                }
-            }
-        }
-    }
-
-    // 表示中はキャレット位置の追従だけ更新する（再描画は TIMER_FADE 任せ）。
-    STATE.with(|s| {
-        let mut s = s.borrow_mut();
-        let Some(state) = s.as_mut() else { return };
-        if state.app.is_visible() {
-            let anchor = caret::indicator_anchor();
-            let (w_px, _) = state.overlay.size_px();
-            state.app.anchor = (anchor.0 - w_px / 2, anchor.1);
-        }
-    });
 }
 
 fn on_fade_tick(hwnd: HWND) {

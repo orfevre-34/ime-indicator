@@ -1,23 +1,18 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::mem::ManuallyDrop;
 
-use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::Ole::{
     SafeArrayAccessData, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData,
 };
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows::Win32::System::Variant::{VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VT_I4};
 use windows::Win32::UI::Accessibility::{
-    AccessibleObjectFromWindow, CUIAutomation, IAccessible, IUIAutomation,
-    IUIAutomationTextPattern, UIA_TextPatternId,
+    CUIAutomation, IUIAutomation, IUIAutomationTextPattern, UIA_TextPatternId,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     GUITHREADINFO, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowRect,
-    GetWindowThreadProcessId, OBJID_CARET,
+    GetWindowThreadProcessId,
 };
 use windows::core::Interface;
 
@@ -28,11 +23,13 @@ thread_local! {
 
 /// インジケータを表示すべきスクリーン座標（左上）を返す。
 ///
-/// 優先順位:
-/// 1. UI Automation で取得したテキストキャレット位置（Chrome/Edge/VS Code 等の TSF アプリ向け）
-/// 2. `GUITHREADINFO.rcCaret`（古典的な IMM アプリ向け）
-/// 3. フォアグラウンドウィンドウの中央付近（マウス位置にはフォールバックしない）
-/// 4. それも取れない時のみ画面の合理的な位置にフォールバック
+/// `AttachThreadInput` は副作用が大きく相手アプリの IME 変換を破壊することがあるため、
+/// すべての経路で `AttachThreadInput` を使わない方式のみで構成する:
+///
+/// 1. UI Automation: フォーカス中の TextPattern の bounding rect を取得（読み取り API のみ）
+/// 2. `GUITHREADINFO.rcCaret`: 古典的な IMM アプリで取れる
+/// 3. フォアグラウンドウィンドウの左下寄り: 上記が取れない時のフォールバック
+/// 4. マウスカーソル付近: 最終フォールバック（普通到達しない）
 pub fn indicator_anchor() -> (i32, i32) {
     let (kind, pos) = resolve_anchor();
     log_anchor_if_changed(kind, pos);
@@ -46,11 +43,8 @@ fn resolve_anchor() -> (&'static str, (i32, i32)) {
     if let Some(p) = caret_via_guithreadinfo() {
         return ("GUITHREADINFO", (p.x + 4, p.y + 4));
     }
-    if let Some(p) = caret_via_msaa() {
-        return ("MSAA", (p.x + 4, p.y + 4));
-    }
-    if let Some(p) = focused_window_anchor() {
-        return ("focused-window", p);
+    if let Some(p) = foreground_window_anchor() {
+        return ("foreground-window", p);
     }
     ("cursor", cursor_pos_with_offset())
 }
@@ -73,84 +67,8 @@ fn log_anchor_if_changed(_kind: &'static str, _pos: (i32, i32)) {
     }
 }
 
-/// MSAA (Microsoft Active Accessibility) の `OBJID_CARET` でフォーカス子ウィンドウの
-/// システムキャレット矩形を取得する。`CreateCaret` を使う標準コントロール（多くの
-/// ネイティブ Win32 / 一部の Electron も含む）で動作する。
-fn caret_via_msaa() -> Option<POINT> {
-    unsafe {
-        let focus = focused_subwindow()?;
-        let mut iacc: Option<IAccessible> = None;
-        AccessibleObjectFromWindow(
-            focus,
-            OBJID_CARET.0 as u32,
-            &IAccessible::IID,
-            &mut iacc as *mut _ as *mut *mut c_void,
-        )
-        .ok()?;
-        let iacc = iacc?;
-
-        let mut x = 0i32;
-        let mut y = 0i32;
-        let mut w = 0i32;
-        let mut h = 0i32;
-        // CHILDID_SELF = 0 を VT_I4 で。windows-rs の VARIANT は union なので
-        // 手書きで組み立てる。
-        let varchild = childid_self_variant();
-        iacc.accLocation(&mut x, &mut y, &mut w, &mut h, &varchild)
-            .ok()?;
-        if w == 0 && h == 0 {
-            // キャレットが登録されていない（多くの TSF アプリ）。
-            return None;
-        }
-        Some(POINT { x, y: y + h })
-    }
-}
-
-fn childid_self_variant() -> VARIANT {
-    let inner = ManuallyDrop::new(VARIANT_0_0 {
-        vt: VARENUM(VT_I4.0),
-        wReserved1: 0,
-        wReserved2: 0,
-        wReserved3: 0,
-        Anonymous: unsafe { std::mem::zeroed() },
-    });
-    // Anonymous は union; lVal 相当を 0 に。zeroed で OK。
-    VARIANT {
-        Anonymous: VARIANT_0 { Anonymous: inner },
-    }
-}
-
-/// フォアグラウンドのスレッドにアタッチして `GetFocus` で「実際にキー入力を受ける
-/// 子ウィンドウ」を取り、見つからなければトップレベルウィンドウを返す。
-fn focused_subwindow() -> Option<HWND> {
-    unsafe {
-        let fg = GetForegroundWindow();
-        if fg.0.is_null() {
-            return None;
-        }
-        let fg_tid = GetWindowThreadProcessId(fg, None);
-        if fg_tid == 0 {
-            return Some(fg);
-        }
-        let my_tid = GetCurrentThreadId();
-        let attached = if fg_tid != my_tid {
-            AttachThreadInput(my_tid, fg_tid, true).as_bool()
-        } else {
-            false
-        };
-        let focus = GetFocus();
-        if attached {
-            let _ = AttachThreadInput(my_tid, fg_tid, false);
-        }
-        if !focus.0.is_null() {
-            Some(focus)
-        } else {
-            Some(fg)
-        }
-    }
-}
-
-/// UI Automation でフォーカス中の要素のキャレット位置を取得する。TSF 系アプリでも有効。
+/// UI Automation でフォーカス中の要素のキャレット位置を取得する。
+/// 読み取り専用 API なので相手アプリの入力状態には影響しない。
 fn caret_via_uia() -> Option<POINT> {
     UIA.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -164,19 +82,15 @@ fn caret_via_uia() -> Option<POINT> {
 
         unsafe {
             let focused = auto.GetFocusedElement().ok()?;
-
-            // フォーカス要素が TextPattern を持たない（純粋なボタン等）なら諦める。
             let pattern_unknown = focused.GetCurrentPattern(UIA_TextPatternId).ok()?;
             let text_pattern: IUIAutomationTextPattern = pattern_unknown.cast().ok()?;
 
-            // 現在の選択範囲（キャレットだけのときは幅 0 の range が 1 つ）。
             let selection = text_pattern.GetSelection().ok()?;
             if selection.Length().ok()? == 0 {
                 return None;
             }
             let range = selection.GetElement(0).ok()?;
 
-            // GetBoundingRectangles は SAFEARRAY<f64>: [x0,y0,w0,h0, x1,y1,w1,h1, ...]。
             let safearray_ptr = range.GetBoundingRectangles().ok()?;
             if safearray_ptr.is_null() {
                 return None;
@@ -221,6 +135,7 @@ fn caret_via_guithreadinfo() -> Option<POINT> {
             cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
             ..Default::default()
         };
+        // GetGUIThreadInfo はクロススレッドでも安全に読める（読み取り API）。
         GetGUIThreadInfo(tid, &mut info).ok()?;
 
         let r = info.rcCaret;
@@ -228,12 +143,11 @@ fn caret_via_guithreadinfo() -> Option<POINT> {
             return None;
         }
 
-        let mut owner = info.hwndCaret;
+        // hwndCaret が無いと ClientToScreen で変換できない。AttachThreadInput を
+        // 使えば GetFocus で代替できるが、ここは諦めて諦観する（副作用回避を優先）。
+        let owner = info.hwndCaret;
         if owner.0.is_null() {
-            owner = GetFocus();
-            if owner.0.is_null() {
-                return None;
-            }
+            return None;
         }
 
         let mut pt = POINT {
@@ -245,14 +159,17 @@ fn caret_via_guithreadinfo() -> Option<POINT> {
     }
 }
 
-/// フォーカス子ウィンドウ（無ければフォアグラウンドのトップレベル）の左下寄りに
-/// フォールバック。最大化された VS Code などでも編集領域に近い位置に出る。
-/// マウスカーソルの位置よりは「ユーザーの注視点」に近い。
-fn focused_window_anchor() -> Option<(i32, i32)> {
+/// フォアグラウンドのトップレベルウィンドウの左下寄りに出す簡易フォールバック。
+/// `AttachThreadInput + GetFocus` で焦点子ウィンドウを取れば精度が上がるが、
+/// 入力を壊す副作用を避けるためトップレベルだけで妥協する。
+fn foreground_window_anchor() -> Option<(i32, i32)> {
     unsafe {
-        let target = focused_subwindow()?;
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return None;
+        }
         let mut rect = RECT::default();
-        GetWindowRect(target, &mut rect).ok()?;
+        GetWindowRect(fg, &mut rect).ok()?;
         // ウィンドウの左下寄り（編集領域の最終行近くを想定）。
         let x = rect.left + 32;
         let y = rect.bottom - 64;
