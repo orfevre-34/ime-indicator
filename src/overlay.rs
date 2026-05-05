@@ -1,14 +1,15 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use windows::Win32::Foundation::{COLORREF, HWND, POINT, SIZE};
+use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_ROUNDED_RECT, D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget, ID2D1SolidColorBrush,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+    D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE, D2D1_ROUNDED_RECT, D2D1CreateFactory,
+    ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
@@ -21,10 +22,6 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP,
     HDC, ReleaseDC, SelectObject,
 };
-use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICImagingFactory,
-};
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::WindowsAndMessaging::{ULW_ALPHA, UpdateLayeredWindow};
 use windows::core::{Result, w};
 
@@ -45,13 +42,10 @@ pub struct Overlay {
     mem_dc: HDC,
     dib: HBITMAP,
     old_obj: windows::Win32::Graphics::Gdi::HGDIOBJ,
-    bits: *mut c_void,
 
-    // D2D / DWrite / WIC
-    _wic_factory: IWICImagingFactory,
-    _wic_bitmap: IWICBitmap,
+    // D2D / DWrite
     _d2d_factory: ID2D1Factory,
-    rt: ID2D1RenderTarget,
+    rt: ID2D1DCRenderTarget,
     text_format: IDWriteTextFormat,
 }
 
@@ -62,7 +56,8 @@ impl Overlay {
         let height_px = (HEIGHT_DIPS * dpi_scale).round() as i32;
 
         unsafe {
-            // 1. 画面 DC からメモリ DC + 32bpp DIB section を確保。
+            // 1. 画面 DC からメモリ DC + 32bpp top-down DIB section。
+            //    DIB は mem_dc に SelectObject で結びつけたままにする。
             let screen_dc = GetDC(None);
             let mem_dc = CreateCompatibleDC(Some(screen_dc));
 
@@ -70,8 +65,7 @@ impl Overlay {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                     biWidth: width_px,
-                    // 上下反転の DIB（top-down）にして座標を素直に扱う。
-                    biHeight: -height_px,
+                    biHeight: -height_px, // top-down
                     biPlanes: 1,
                     biBitCount: 32,
                     biCompression: BI_RGB.0,
@@ -85,23 +79,8 @@ impl Overlay {
             let old_obj = SelectObject(mem_dc, dib.into());
             ReleaseDC(None, screen_dc);
 
-            // 2. WIC bitmap を DIB のメモリに被せる（コピーしない）。
-            let wic_factory: IWICImagingFactory =
-                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
-
-            let stride: u32 = (width_px * 4) as u32;
-            let total: u32 = stride * height_px as u32;
-            let buf: &[u8] = std::slice::from_raw_parts(bits as *const u8, total as usize);
-
-            let wic_bitmap = wic_factory.CreateBitmapFromMemory(
-                width_px as u32,
-                height_px as u32,
-                &GUID_WICPixelFormat32bppPBGRA,
-                stride,
-                buf,
-            )?;
-
-            // 3. Direct2D ファクトリと WIC bitmap 上のレンダーターゲット。
+            // 2. Direct2D ファクトリと DC レンダーターゲット。WIC を経由せず、mem_dc に
+            //    BindDC で直接バインドして描画 → そのまま UpdateLayeredWindow に渡せる。
             let d2d_factory: ID2D1Factory =
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
 
@@ -111,18 +90,17 @@ impl Overlay {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
                     alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
-                // RT 内部の座標は DIP。WIC bitmap の物理 px と DIP のスケールを合わせる
-                // ため、DPI を実 DPI で指定して描画は DIP で行えるようにする。
+                // DIP 基準で描画したいので、実 DPI を伝える。
                 dpiX: 96.0 * dpi_scale,
                 dpiY: 96.0 * dpi_scale,
-                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                // DC RT は GDI 互換でなければならない。
+                usage: D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE,
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
-            let rt = d2d_factory.CreateWicBitmapRenderTarget(&wic_bitmap, &rt_props)?;
+            let rt: ID2D1DCRenderTarget = d2d_factory.CreateDCRenderTarget(&rt_props)?;
 
-            // 4. DirectWrite text format。
+            // 3. DirectWrite text format。
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-
             let text_format = dwrite.CreateTextFormat(
                 w!("Segoe UI"),
                 None,
@@ -142,9 +120,6 @@ impl Overlay {
                 mem_dc,
                 dib,
                 old_obj,
-                bits,
-                _wic_factory: wic_factory,
-                _wic_bitmap: wic_bitmap,
                 _d2d_factory: d2d_factory,
                 rt,
                 text_format,
@@ -153,12 +128,25 @@ impl Overlay {
     }
 
     /// 指定座標にインジケータを再描画して表示更新する。
-    pub fn render(&self, screen_x: i32, screen_y: i32, mode: ImeMode, opacity: f32) -> Result<()> {
+    pub fn render(
+        &self,
+        screen_x: i32,
+        screen_y: i32,
+        mode: ImeMode,
+        opacity: f32,
+    ) -> Result<()> {
         let opacity = opacity.clamp(0.0, 1.0);
         unsafe {
-            self.rt.BeginDraw();
+            // BindDC は毎フレーム呼ぶのが規約。RT はその DC のサイズに合わせて初期化される。
+            let bind_rect = RECT {
+                left: 0,
+                top: 0,
+                right: self.width_px,
+                bottom: self.height_px,
+            };
+            self.rt.BindDC(self.mem_dc, &bind_rect)?;
 
-            // 完全透明でクリア。
+            self.rt.BeginDraw();
             self.rt.Clear(Some(&D2D1_COLOR_F {
                 r: 0.0,
                 g: 0.0,
@@ -166,7 +154,6 @@ impl Overlay {
                 a: 0.0,
             }));
 
-            // 背景ラウンド矩形: rgba(28, 28, 30, 0.85) を opacity で減衰。
             let bg = self.rt.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
                     r: 0.110,
@@ -191,7 +178,6 @@ impl Overlay {
                 &bg,
             );
 
-            // テキスト。
             let glyph: &[u16] = match mode {
                 ImeMode::Alpha => &[b'A' as u16],
                 ImeMode::Hiragana => &[0x3042u16], // 'あ'
@@ -260,14 +246,9 @@ impl Overlay {
 impl Drop for Overlay {
     fn drop(&mut self) {
         unsafe {
-            // DC から DIB を外して破棄。
             SelectObject(self.mem_dc, self.old_obj);
             let _ = DeleteObject(self.dib.into());
             let _ = DeleteDC(self.mem_dc);
-            // _wic_bitmap は内部で `bits` を参照しているので、
-            // ID2D1RenderTarget / IWICBitmap が drop されたあとに DIB を消すのが安全。
-            // 構造体フィールドの drop 順は宣言順なので、rt → wic_bitmap → ここの DC/DIB の順。
-            let _ = self.bits; // keep field used (suppress unused warning even if all paths use it)
         }
     }
 }

@@ -17,8 +17,6 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
-    "Win32_Graphics_Imaging",
-    "Win32_Graphics_Imaging_D2D",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",
