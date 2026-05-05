@@ -17,3 +17,6 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+
+# Installer build outputs
+installer/out/

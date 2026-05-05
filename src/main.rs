@@ -18,6 +18,7 @@ mod app;
 mod caret;
 mod ime;
 mod overlay;
+mod startup;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -28,15 +29,21 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-    HHOOK, KBDLLHOOKSTRUCT, KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SW_SHOWNOACTIVATE, SetTimer, SetWindowsHookExW, ShowWindow, TranslateMessage,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_DESTROY, WM_KEYUP, WM_SYSKEYUP, WM_TIMER,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+use windows::Win32::UI::Shell::{
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
-use windows::core::w;
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CW_USEDEFAULT, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, HHOOK, HICON,
+    IDC_ARROW, IMAGE_ICON, KBDLLHOOKSTRUCT, KillTimer, LR_DEFAULTCOLOR, LR_SHARED, LoadCursorW,
+    LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SW_SHOWNOACTIVATE, SetForegroundWindow, SetTimer,
+    SetWindowsHookExW, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_COMMAND, WM_DESTROY, WM_KEYUP, WM_LBUTTONUP,
+    WM_RBUTTONUP, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+};
+use windows::core::{PCWSTR, w};
 
 use crate::app::App;
 use crate::ime::ImeMode;
@@ -51,6 +58,17 @@ const FADE_INTERVAL_MS: u32 = 16;
 /// wparam にモード(int)を載せる。モードが変わっていなくても表示寿命を延ばす目的で
 /// この経路に投げてよい。
 const WM_APP_IME_CHANGED: u32 = WM_APP + 1;
+/// 通知領域 (タスクトレイ) アイコンからのコールバックメッセージ。
+const WM_APP_TRAY: u32 = WM_APP + 3;
+
+/// 通知領域に登録するアイコン ID。同一プロセス内で 1 個だけ使う。
+const TRAY_ICON_ID: u32 = 1;
+/// 埋め込みリソース内のアプリアイコン ID（app.rc の IDI_APP_ICON と一致させる）。
+const IDI_APP_ICON: u16 = 1;
+
+/// メニュー項目 ID。
+const IDM_TOGGLE_AUTOSTART: u32 = 1001;
+const IDM_QUIT: u32 = 1002;
 
 const MODE_ALPHA: i32 = 0;
 const MODE_HIRAGANA: i32 = 1;
@@ -77,6 +95,8 @@ fn main() -> windows::core::Result<()> {
         let hinstance: HINSTANCE = GetModuleHandleW(None)?.into();
         let class_name = w!("ImeIndicatorOverlay");
 
+        let app_icon = load_app_icon(hinstance);
+
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: Default::default(),
@@ -84,12 +104,12 @@ fn main() -> windows::core::Result<()> {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinstance,
-            hIcon: Default::default(),
-            hCursor: LoadCursorW(None, windows::Win32::UI::WindowsAndMessaging::IDC_ARROW)?,
+            hIcon: app_icon,
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
             hbrBackground: Default::default(),
-            lpszMenuName: windows::core::PCWSTR::null(),
+            lpszMenuName: PCWSTR::null(),
             lpszClassName: class_name,
-            hIconSm: Default::default(),
+            hIconSm: app_icon,
         };
         if RegisterClassExW(&wc) == 0 {
             return Err(windows::core::Error::from_thread());
@@ -159,6 +179,13 @@ fn main() -> windows::core::Result<()> {
             }
         }
 
+        // 通知領域アイコン登録。失敗しても致命ではない（インジケータ表示は継続）。
+        if let Err(e) = add_tray_icon(hwnd, app_icon) {
+            #[cfg(debug_assertions)]
+            eprintln!("ime-indicator: failed to register tray icon: {e}");
+            let _ = e;
+        }
+
         SetTimer(Some(hwnd), TIMER_POLL, POLL_INTERVAL_MS, None);
         SetTimer(Some(hwnd), TIMER_FADE, FADE_INTERVAL_MS, None);
 
@@ -193,9 +220,35 @@ unsafe extern "system" fn wnd_proc(
                 apply_mode_change(hwnd, new_mode);
                 LRESULT(0)
             }
+            m if m == WM_APP_TRAY => {
+                let evt = lparam.0 as u32 & 0xFFFF;
+                if evt == WM_LBUTTONUP || evt == WM_RBUTTONUP {
+                    show_tray_menu(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                let id = (wparam.0 & 0xFFFF) as u32;
+                match id {
+                    IDM_TOGGLE_AUTOSTART => {
+                        let target = !startup::is_enabled();
+                        if let Err(e) = startup::set_enabled(target) {
+                            #[cfg(debug_assertions)]
+                            eprintln!("ime-indicator: autostart toggle failed: {e}");
+                            let _ = e;
+                        }
+                    }
+                    IDM_QUIT => {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
             WM_DESTROY => {
                 let _ = KillTimer(Some(hwnd), TIMER_POLL);
                 let _ = KillTimer(Some(hwnd), TIMER_FADE);
+                let _ = remove_tray_icon(hwnd);
                 let raw = HOOK_HANDLE.swap(0, Ordering::Relaxed);
                 if raw != 0 {
                     let _ = UnhookWindowsHookEx(HHOOK(raw as *mut _));
@@ -339,13 +392,13 @@ enum KeyAction {
 
 fn vk_to_action(vk: u32) -> Option<KeyAction> {
     match vk {
-        0x19 => Some(KeyAction::Toggle),       // VK_KANJI / VK_HANJA (半角/全角)
-        0x15 => Some(KeyAction::Toggle),       // VK_KANA / VK_HANGUL
-        0x16 => Some(KeyAction::SetHiragana),  // VK_IME_ON
-        0x1A => Some(KeyAction::SetAlpha),     // VK_IME_OFF
-        0xF0 => Some(KeyAction::SetAlpha),     // VK_DBE_ALPHANUMERIC (英数 / lang0)
-        0xF1 => Some(KeyAction::SetKatakana),  // VK_DBE_KATAKANA
-        0xF2 => Some(KeyAction::SetHiragana),  // VK_DBE_HIRAGANA (かな / lang1)
+        0x19 => Some(KeyAction::Toggle), // VK_KANJI / VK_HANJA (半角/全角)
+        0x15 => Some(KeyAction::Toggle), // VK_KANA / VK_HANGUL
+        0x16 => Some(KeyAction::SetHiragana), // VK_IME_ON
+        0x1A => Some(KeyAction::SetAlpha), // VK_IME_OFF
+        0xF0 => Some(KeyAction::SetAlpha), // VK_DBE_ALPHANUMERIC (英数 / lang0)
+        0xF1 => Some(KeyAction::SetKatakana), // VK_DBE_KATAKANA
+        0xF2 => Some(KeyAction::SetHiragana), // VK_DBE_HIRAGANA (かな / lang1)
         0xF3 | 0xF4 => Some(KeyAction::Toggle), // VK_DBE_SBCSCHAR / DBCSCHAR
         _ => None,
     }
@@ -394,4 +447,79 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// 埋め込みリソースから 32px のアプリアイコンを読み込む。
+fn load_app_icon(hinstance: HINSTANCE) -> HICON {
+    unsafe {
+        match LoadImageW(
+            Some(hinstance),
+            PCWSTR(IDI_APP_ICON as usize as *const u16),
+            IMAGE_ICON,
+            32,
+            32,
+            LR_DEFAULTCOLOR | LR_SHARED,
+        ) {
+            Ok(h) => HICON(h.0),
+            Err(_) => HICON::default(),
+        }
+    }
+}
+
+fn add_tray_icon(hwnd: HWND, hicon: HICON) -> windows::core::Result<()> {
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+        uCallbackMessage: WM_APP_TRAY,
+        hIcon: hicon,
+        ..Default::default()
+    };
+    // Tooltip 文字列（最大 128 wchar）。
+    let tip: &[u16] = &"IME Indicator\0".encode_utf16().collect::<Vec<u16>>();
+    let n = tip.len().min(nid.szTip.len());
+    nid.szTip[..n].copy_from_slice(&tip[..n]);
+
+    unsafe { Shell_NotifyIconW(NIM_ADD, &nid).ok() }
+}
+
+fn remove_tray_icon(hwnd: HWND) -> windows::core::Result<()> {
+    let nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ICON_ID,
+        ..Default::default()
+    };
+    unsafe { Shell_NotifyIconW(NIM_DELETE, &nid).ok() }
+}
+
+fn show_tray_menu(hwnd: HWND) {
+    unsafe {
+        let menu = match CreatePopupMenu() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let autostart_flag = if startup::is_enabled() {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | autostart_flag,
+            IDM_TOGGLE_AUTOSTART as usize,
+            w!("Windows ログオン時に自動起動"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, IDM_QUIT as usize, w!("終了"));
+
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        let _ = GetCursorPos(&mut pt);
+
+        // メニュー外クリックで閉じるためにフォアグラウンドにする必要がある。
+        let _ = SetForegroundWindow(hwnd);
+        let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, Some(0), hwnd, None);
+        let _ = DestroyMenu(menu);
+    }
 }

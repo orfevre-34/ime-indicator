@@ -1,0 +1,6 @@
+// Windows resource definitions for ime-indicator.
+// IDI_APP_ICON = 1 must match the integer used by LoadIconW(hinstance, MAKEINTRESOURCE(1)).
+
+#define IDI_APP_ICON 1
+
+IDI_APP_ICON ICON "assets\\icon.ico"
