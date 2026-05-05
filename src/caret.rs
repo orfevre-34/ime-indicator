@@ -34,30 +34,43 @@ thread_local! {
 /// 3. フォアグラウンドウィンドウの中央付近（マウス位置にはフォールバックしない）
 /// 4. それも取れない時のみ画面の合理的な位置にフォールバック
 pub fn indicator_anchor() -> (i32, i32) {
+    let (kind, pos) = resolve_anchor();
+    log_anchor_if_changed(kind, pos);
+    pos
+}
+
+fn resolve_anchor() -> (&'static str, (i32, i32)) {
     if let Some(p) = caret_via_uia() {
-        #[cfg(debug_assertions)]
-        eprintln!("ime-indicator: anchor=UIA ({}, {})", p.x, p.y);
-        return (p.x + 4, p.y + 4);
+        return ("UIA", (p.x + 4, p.y + 4));
     }
     if let Some(p) = caret_via_guithreadinfo() {
-        #[cfg(debug_assertions)]
-        eprintln!("ime-indicator: anchor=GUITHREADINFO ({}, {})", p.x, p.y);
-        return (p.x + 4, p.y + 4);
+        return ("GUITHREADINFO", (p.x + 4, p.y + 4));
     }
     if let Some(p) = caret_via_msaa() {
-        #[cfg(debug_assertions)]
-        eprintln!("ime-indicator: anchor=MSAA ({}, {})", p.x, p.y);
-        return (p.x + 4, p.y + 4);
+        return ("MSAA", (p.x + 4, p.y + 4));
     }
     if let Some(p) = focused_window_anchor() {
-        #[cfg(debug_assertions)]
-        eprintln!("ime-indicator: anchor=focused-window ({}, {})", p.0, p.1);
-        return p;
+        return ("focused-window", p);
     }
-    let p = cursor_pos_with_offset();
+    ("cursor", cursor_pos_with_offset())
+}
+
+fn log_anchor_if_changed(_kind: &'static str, _pos: (i32, i32)) {
     #[cfg(debug_assertions)]
-    eprintln!("ime-indicator: anchor=cursor ({}, {})", p.0, p.1);
-    p
+    {
+        thread_local! {
+            static LAST: RefCell<Option<(&'static str, (i32, i32))>> = const {
+                RefCell::new(None)
+            };
+        }
+        LAST.with(|cell| {
+            let mut last = cell.borrow_mut();
+            if last.as_ref() != Some(&(_kind, _pos)) {
+                eprintln!("ime-indicator: anchor={_kind} ({}, {})", _pos.0, _pos.1);
+                *last = Some((_kind, _pos));
+            }
+        });
+    }
 }
 
 /// MSAA (Microsoft Active Accessibility) の `OBJID_CARET` でフォーカス子ウィンドウの

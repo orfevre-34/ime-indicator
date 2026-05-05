@@ -192,7 +192,7 @@ unsafe extern "system" fn wnd_proc(
             }
             m if m == WM_APP_IME_CHANGED => {
                 let new_mode = int_to_mode(wparam.0 as i32);
-                trigger_fade(hwnd, new_mode);
+                apply_mode_change(hwnd, new_mode);
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -211,7 +211,9 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-fn trigger_fade(hwnd: HWND, mode: ImeMode) {
+/// IME モード変化が来たときに呼ぶ。常駐表示なのでフェードはやり直さず、
+/// 表示中の文字と座標だけ即座に差し替えて 1 度描画する。
+fn apply_mode_change(_hwnd: HWND, mode: ImeMode) {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         let Some(state) = s.as_mut() else { return };
@@ -227,9 +229,10 @@ fn trigger_fade(hwnd: HWND, mode: ImeMode) {
             state.app.current_mode, mode, pos
         );
         state.app.on_mode_changed(mode, pos);
-        unsafe {
-            SetTimer(Some(hwnd), TIMER_FADE, FADE_INTERVAL_MS, None);
-        }
+        let opacity = state.app.current_opacity();
+        let _ = state
+            .overlay
+            .render(pos.0, pos.1, state.app.current_mode, opacity);
     });
 }
 
@@ -259,23 +262,39 @@ fn on_poll_tick(_hwnd: HWND) {
         }
     }
 
-    let Some(mode) = mode_opt else { return };
-    let new_int = mode_to_int(mode);
-    let prev_int = MODE_ATOM.swap(new_int, Ordering::Relaxed);
-    if prev_int != new_int {
-        // 自分でも post して同じ経路（trigger_fade）に流す。
-        let raw = OVERLAY_HWND_ATOM.load(Ordering::Relaxed);
-        if raw != 0 {
-            unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(raw as *mut _)),
-                    WM_APP_IME_CHANGED,
-                    WPARAM(new_int as usize),
-                    LPARAM(0),
-                );
+    if let Some(mode) = mode_opt {
+        let new_int = mode_to_int(mode);
+        let prev_int = MODE_ATOM.swap(new_int, Ordering::Relaxed);
+        if prev_int != new_int {
+            // フックと同じ経路（apply_mode_change）に流す。
+            let raw = OVERLAY_HWND_ATOM.load(Ordering::Relaxed);
+            if raw != 0 {
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(raw as *mut _)),
+                        WM_APP_IME_CHANGED,
+                        WPARAM(new_int as usize),
+                        LPARAM(0),
+                    );
+                }
             }
         }
     }
+
+    // 常駐表示なので、ポーリングのたびにキャレット位置を再取得して再描画する。
+    // 16ms で回すと UIA のコストがバカにならないので、100ms 毎の再描画に留める。
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let Some(state) = s.as_mut() else { return };
+        let anchor = caret::indicator_anchor();
+        let (w_px, _) = state.overlay.size_px();
+        let pos = (anchor.0 - w_px / 2, anchor.1);
+        state.app.anchor = pos;
+        let opacity = state.app.current_opacity();
+        let _ = state
+            .overlay
+            .render(pos.0, pos.1, state.app.current_mode, opacity);
+    });
 }
 
 fn on_fade_tick(hwnd: HWND) {
@@ -283,22 +302,19 @@ fn on_fade_tick(hwnd: HWND) {
         let mut s = s.borrow_mut();
         let Some(state) = s.as_mut() else { return };
 
-        match state.app.tick() {
-            Some(opacity) => {
-                let (x, y) = state.app.anchor;
-                if let Err(e) = state.overlay.render(x, y, state.app.current_mode, opacity) {
-                    #[cfg(debug_assertions)]
-                    eprintln!("ime-indicator: render error: {e}");
-                    let _ = e;
-                }
-            }
-            None => {
-                unsafe {
-                    let _ = KillTimer(Some(hwnd), TIMER_FADE);
-                }
-                let _ = state
-                    .overlay
-                    .render(-10_000, -10_000, state.app.current_mode, 0.0);
+        let opacity = state.app.current_opacity();
+        let (x, y) = state.app.anchor;
+        if let Err(e) = state.overlay.render(x, y, state.app.current_mode, opacity) {
+            #[cfg(debug_assertions)]
+            eprintln!("ime-indicator: render error: {e}");
+            let _ = e;
+        }
+
+        // 起動時のフェードインが終わったら 16ms タイマーを止める。以降の再描画は
+        // 100ms ポーリングの方で十分（常駐表示で動かない）。
+        if !state.app.is_animating() {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_FADE);
             }
         }
     });
