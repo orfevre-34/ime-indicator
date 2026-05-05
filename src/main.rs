@@ -180,23 +180,36 @@ unsafe extern "system" fn wnd_proc(
 }
 
 fn on_poll_tick(hwnd: HWND) {
-    let Some(mode) = ime::read_current_mode() else {
-        // フォアグラウンドが IME コンテキストを持たないアプリ（一部の Win32 / コマンドプロンプト等）。
-        // 何もせず次のポーリングを待つ。
-        return;
-    };
+    let mode_opt = ime::read_current_mode();
+
+    // dev ビルドのみ: 1 秒に 1 回（10 ポーリング毎）の生存ログ。
+    // 「ポーリングは動いているが mode が変わって見えない」のか
+    // 「そもそもポーリング自体が止まっている」のかを切り分けるため。
+    #[cfg(debug_assertions)]
+    {
+        use std::cell::Cell;
+        thread_local! {
+            static POLL_COUNT: Cell<u32> = const { Cell::new(0) };
+        }
+        let n = POLL_COUNT.with(|c| {
+            let v = c.get() + 1;
+            c.set(v);
+            v
+        });
+        if n % 10 == 0 {
+            let fg_hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+            eprintln!(
+                "ime-indicator: poll#{n} fg=0x{:x} mode={:?}",
+                fg_hwnd.0 as usize, mode_opt
+            );
+        }
+    }
+
+    let Some(mode) = mode_opt else { return };
+
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         let Some(state) = s.as_mut() else { return };
-
-        // 起動直後の空状態を埋める（最初の 1 回はトリガしない。今のモードを基準にする）。
-        if state.app.last_mode.is_none() && !state.app.is_visible() {
-            state.app.current_mode = mode;
-            state.app.last_mode = Some(mode);
-            #[cfg(debug_assertions)]
-            eprintln!("ime-indicator: initial mode = {:?}", mode);
-            return;
-        }
 
         if mode != state.app.current_mode {
             let anchor = caret::indicator_anchor();

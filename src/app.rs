@@ -79,9 +79,6 @@ impl App {
         }
     }
 
-    pub fn is_visible(&self) -> bool {
-        !matches!(self.phase, Phase::Hidden)
-    }
 }
 
 fn ease_out(t: f32) -> f32 {
