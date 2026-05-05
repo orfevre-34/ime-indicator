@@ -6,13 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # Node.js 20 deprecation 対応: 既存アクションの内部 Node を 24 に揃える。
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   check:
     runs-on: windows-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
