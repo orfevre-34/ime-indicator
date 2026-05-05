@@ -8,8 +8,9 @@ const FADE_OUT: Duration = Duration::from_millis(200);
 
 /// 表示ライフサイクル。
 ///
-/// IME モード変化に加え、任意のキー入力でも `Visible` 期限が伸びる。
-/// 1.5 秒キーが押されない（=入力していない）ときだけフェードアウトして消える。
+/// IME トリガーキーが押されるたびに `show_or_extend` が呼ばれて表示寿命が
+/// 1.5 秒先まで伸びる。トリガーキーが 1.5 秒以上押されないとフェードアウトして
+/// 消える。普通の文字キー等では表示は変化しない。
 #[derive(Debug, Clone, Copy)]
 pub enum Phase {
     Hidden,
@@ -41,17 +42,6 @@ impl App {
         self.current_mode = new_mode;
         self.anchor = anchor;
         self.show_or_extend();
-    }
-
-    /// IME モードは変わらないがキー入力があったとき。可視化を延長するだけ。
-    /// 既に表示中ならアンカーは動かさない（タイピング中の位置ジッター防止）。
-    pub fn on_key_activity(&mut self) {
-        self.show_or_extend();
-    }
-
-    /// 隠れ状態 → 出すときの初期位置を最新キャレット位置で更新する用。
-    pub fn set_anchor(&mut self, anchor: (i32, i32)) {
-        self.anchor = anchor;
     }
 
     fn show_or_extend(&mut self) {
